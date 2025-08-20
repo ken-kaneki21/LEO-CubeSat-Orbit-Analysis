@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual env
+.venv/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Secrets / local settings
+.env
+
+# Caches
+.skyfield/
+
+# Generated outputs (optional to ignore)
+figures/
+summary/
