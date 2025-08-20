@@ -2,53 +2,35 @@
 LEO Satellite Orbit Propagation and Maneuver Planning — Historical Window (No-Poliastro Version)
 Period: September 1, 2024 → February 28, 2025 (inclusive)
 
-This version removes the poliastro & astropy dependency to simplify installs on Windows.
-It uses only: skyfield, sgp4, numpy, pandas, matplotlib, requests.
+Adds:
+- Multi-satellite support (set NORAD_IDS to several IDs)
+- Ground-station pass prediction for Bengaluru (≥ 10°): summary/passes_bengaluru.csv
+- 24h ground-track animation GIF at the mid-window epoch per satellite
 
-What this script does
----------------------
-1) Pulls **historical TLEs** between 2024‑09‑01 and 2025‑02‑28 (Space-Track API or local file).
-2) Uses **SGP4** (Skyfield) to propagate **24‑hour ground tracks** (weekly samples by default).
-3) Summarizes weekly osculating elements (a, e, i, RAAN) and RAAN drift across the window.
-4) Picks a **mid‑window reference epoch** and computes a **Hohmann altitude change** plan (ΔV, timing, transfer time).
-5) Estimates **propellant** via Tsiolkovsky.
-
-Outputs
--------
-- figures/ground_track_YYYYMMDD.png   — weekly ground tracks over the window
-- figures/altitude_time_YYYYMMDD.png  — altitude profiles for each 24h window
-- summary/orbit_weekly_summary.csv    — elements + RAAN drift per sample
-- summary/maneuver_plan.txt           — ΔV breakdown & fuel estimate at reference date
-
-Usage (quick)
--------------
-1) Install deps in your venv:
-   pip install numpy pandas matplotlib skyfield sgp4 requests
-2) Set NORAD_IDS and (optionally) Space-Track creds below.
-3) Run: python leo_historical_tle_nopoliastro.py
+Deps: numpy, pandas, matplotlib, skyfield, sgp4, requests, pillow
 """
 
 from __future__ import annotations
 import os
 import math
 import time
-import json
 import textwrap
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
 
 from skyfield.api import Loader, EarthSatellite, wgs84
 
 # -----------------------------
-# CONSTANTS (no poliastro/astropy required)
+# CONSTANTS
 # -----------------------------
-MU_EARTH_KM3_S2 = 398600.4418           # Earth GM [km^3/s^2]
-R_EARTH_KM      = 6378.137              # Earth equatorial radius [km]
+MU_EARTH_KM3_S2 = 398600.4418           # km^3/s^2
+R_EARTH_KM      = 6378.137              # km
 G0              = 9.80665               # m/s^2
 
 # -----------------------------
@@ -57,30 +39,37 @@ G0              = 9.80665               # m/s^2
 START_UTC = datetime(2024, 9, 1, 0, 0, 0, tzinfo=timezone.utc)
 END_UTC   = datetime(2025, 2, 28, 23, 59, 59, tzinfo=timezone.utc)
 
-# Provide at least one NORAD ID (placeholder below — replace with your target)
-NORAD_IDS = [42915]  # e.g., [25544] for ISS (for a quick test)
+# You can put several satellites here:
+# e.g., ISS for testing [25544], Cartosat-2F [42915], add more like [25544, 42915]
+NORAD_IDS = [25544, 20580, 25994, 27424, 39084, 49260, 40697, 33591]
 
-# Weekly sampling across the window (set to 1 for daily, 7 for weekly, etc.)
+# How often to sample days inside the window (1=daily, 7=weekly)
 SAMPLE_EVERY_DAYS = 7
 
-# Propagation settings for each selected epoch
+# Per-epoch 24h propagation settings
 PROP_DURATION_HOURS = 24
 PROP_STEP_SECONDS   = 60
 
-# Ground station (optional): Bangalore approx; used for a map marker
+# Ground station (Bengaluru)
 GROUND_STATION_LAT = 12.9716
 GROUND_STATION_LON = 77.5946
+MIN_ELEVATION_DEG  = 10.0  # pass threshold
 
-# Maneuver plan assumptions (for mid‑window reference epoch)
-TARGET_ALTITUDE_DELTA_KM = +50.0  # raise circular altitude by +50 km
+# Maneuver plan assumptions (for mid-window reference epoch)
+TARGET_ALTITUDE_DELTA_KM = +50.0
 M0_KG  = 5.0
 ISP_S  = 220.0
 
-# Space-Track credentials (optional but recommended for reliable history)
+# Animation settings (GIF)
+MAKE_ANIMATION = True
+ANIM_MAX_FRAMES = 300  # cap frames so GIF stays small
+ANIM_FPS = 20
+
+# Space-Track credentials (optional)
 SPACETRACK_USERNAME = os.getenv("SPACETRACK_USERNAME", "")
 SPACETRACK_PASSWORD = os.getenv("SPACETRACK_PASSWORD", "")
 
-# Fallback local TLE file (if not using Space-Track). Should contain many TLEs over time.
+# Fallback local TLE file (if not using Space-Track)
 LOCAL_TLE_FILE = "tle_history.txt"
 
 # Output folders
@@ -103,9 +92,8 @@ class TLERow:
 # -----------------------------
 # Utilities
 # -----------------------------
-
 def world_outline():
-    # simple coarse outline (avoids Cartopy)
+    # light outline to avoid Cartopy
     coast = np.array([
         [-180, -60], [-170, -55], [-100, -50], [-50, -45], [0, -40], [30, -35],
         [60, -30], [100, -20], [140, -10], [180, 0], [160, 20], [120, 30],
@@ -114,8 +102,8 @@ def world_outline():
     ])
     return coast[:,0], coast[:,1]
 
-
 def parse_tles_from_text(text: str, norad_filter: List[int]) -> List[TLERow]:
+    from skyfield.api import EarthSatellite
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     tles: List[TLERow] = []
     i = 0
@@ -138,23 +126,19 @@ def parse_tles_from_text(text: str, norad_filter: List[int]) -> List[TLERow]:
             i += 1
     return tles
 
-
 def fetch_spacetrack_tles(norad_ids: List[int], start: datetime, end: datetime) -> List[TLERow]:
     """Fetch historical TLEs from Space-Track (requires credentials). If not set, return []."""
     import requests
     if not (SPACETRACK_USERNAME and SPACETRACK_PASSWORD):
         return []
-
     base = "https://www.space-track.org"
     sess = requests.Session()
-
     # Login
     login_data = {"identity": SPACETRACK_USERNAME, "password": SPACETRACK_PASSWORD}
     r = sess.post(base + "/ajaxauth/login", data=login_data, timeout=30)
     if r.status_code != 200:
         print("[WARN] Space-Track login failed; falling back to LOCAL_TLE_FILE if present.")
         return []
-
     tles: List[TLERow] = []
     for norad in norad_ids:
         query = (
@@ -171,15 +155,12 @@ def fetch_spacetrack_tles(norad_ids: List[int], start: datetime, end: datetime) 
             continue
         tles.extend(parse_tles_from_text(resp.text, [norad]))
         time.sleep(0.3)
-
     return tles
-
 
 def load_tles(norad_ids: List[int], start: datetime, end: datetime) -> List[TLERow]:
     tles = fetch_spacetrack_tles(norad_ids, start, end)
     if tles:
         return tles
-
     # Fallback: local file
     if not os.path.exists(LOCAL_TLE_FILE):
         print("[ERROR] No Space-Track credentials and LOCAL_TLE_FILE not found. Provide credentials or a local TLE file with historical data.")
@@ -187,23 +168,23 @@ def load_tles(norad_ids: List[int], start: datetime, end: datetime) -> List[TLER
     with open(LOCAL_TLE_FILE, "r", encoding="utf-8") as f:
         text = f.read()
     all_tles = parse_tles_from_text(text, norad_ids)
-    # Filter by time window
     return [t for t in all_tles if start <= t.epoch_dt <= end]
 
-
-def select_epochs(tles: List[TLERow], sample_every_days: int) -> List[TLERow]:
-    if not tles:
-        return []
-    # Ensure sorted by epoch
-    tles_sorted = sorted(tles, key=lambda t: t.epoch_dt)
-    picked: List[TLERow] = []
-    next_pick = tles_sorted[0].epoch_dt
-    for tle in tles_sorted:
-        if tle.epoch_dt >= next_pick or not picked:
-            picked.append(tle)
-            next_pick = tle.epoch_dt + timedelta(days=sample_every_days)
-    return picked
-
+def select_epochs_per_sat(tles: List[TLERow], sample_every_days: int) -> Dict[int, List[TLERow]]:
+    """Pick epochs per satellite, spaced by sample_every_days."""
+    by = {}
+    for t in tles:
+        by.setdefault(t.norad, []).append(t)
+    for norad in by:
+        by[norad] = sorted(by[norad], key=lambda x: x.epoch_dt)
+        picked = []
+        next_pick = None
+        for tle in by[norad]:
+            if (next_pick is None) or (tle.epoch_dt >= next_pick):
+                picked.append(tle)
+                next_pick = tle.epoch_dt + timedelta(days=sample_every_days)
+        by[norad] = picked
+    return by
 
 def elements_from_satellite(sat: EarthSatellite):
     # Semi-major axis from mean motion (no_kozai in rad/min → rad/s)
@@ -213,7 +194,6 @@ def elements_from_satellite(sat: EarthSatellite):
     i_deg = math.degrees(sat.model.inclo)
     raan_deg = math.degrees(sat.model.nodeo)
     return a_km, e, i_deg, raan_deg
-
 
 def hohmann_delta_v(r1_km: float, r2_km: float):
     a_t = 0.5 * (r1_km + r2_km)
@@ -226,11 +206,9 @@ def hohmann_delta_v(r1_km: float, r2_km: float):
     tof = math.pi * math.sqrt(a_t**3 / MU_EARTH_KM3_S2)  # s
     return dv1, dv2, tof
 
-
 def tsiolkovsky(m0: float, dv_total: float, Isp: float, g0: float = G0):
     mf = m0 / math.exp(dv_total / (Isp * g0))
     return (m0 - mf), mf
-
 
 def plot_groundtrack(subsat_lats, subsat_lons, title: str, outfile: str,
                      gs_lat: Optional[float] = None, gs_lon: Optional[float] = None):
@@ -246,33 +224,25 @@ def plot_groundtrack(subsat_lats, subsat_lons, title: str, outfile: str,
         start = j+1
     if gs_lat is not None and gs_lon is not None:
         ax.scatter([gs_lon], [gs_lat], marker='^', s=60)
-        ax.text(gs_lon+2, gs_lat, "GS", fontsize=9)
+        ax.text(gs_lon+2, gs_lat, "BLR GS", fontsize=9)
     ax.set_xlim(-180, 180); ax.set_ylim(-90, 90)
     ax.set_xlabel("Longitude (deg)"); ax.set_ylabel("Latitude (deg)")
-    ax.set_title(title)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(outfile, dpi=160)
-    plt.close(fig)
-
+    ax.set_title(title); ax.grid(True, alpha=0.3)
+    fig.tight_layout(); fig.savefig(outfile, dpi=160); plt.close(fig)
 
 def plot_altitude(time_hours, alt_km, title: str, outfile: str):
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(time_hours, alt_km)
     ax.set_xlabel("Time since start (hours)")
     ax.set_ylabel("Geodetic altitude (km)")
-    ax.set_title(title)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(outfile, dpi=160)
-    plt.close(fig)
-
+    ax.set_title(title); ax.grid(True, alpha=0.3)
+    fig.tight_layout(); fig.savefig(outfile, dpi=160); plt.close(fig)
 
 def propagate_24h(sat: EarthSatellite, start_dt: datetime, step_s: int):
     t0 = ts.from_datetime(start_dt)
     tN = ts.from_datetime(start_dt + timedelta(hours=PROP_DURATION_HOURS))
-    t = t0
     times, lats, lons, alts = [], [], [], []
+    t = t0
     while t.tt <= tN.tt:
         geoc = sat.at(t)
         sub = wgs84.subpoint(geoc)
@@ -283,117 +253,221 @@ def propagate_24h(sat: EarthSatellite, start_dt: datetime, step_s: int):
         t = ts.from_datetime(t.utc_datetime().replace(tzinfo=timezone.utc) + timedelta(seconds=step_s))
     return times, lats, lons, alts
 
+# ---------- Pass prediction (Bengaluru) ----------
+def elevation_profile(sat: EarthSatellite, times):
+    # Vectorized alt/az relative to BLR ground station
+    ground = wgs84.latlon(GROUND_STATION_LAT, GROUND_STATION_LON)
+    t_vec = ts.tt_jd([ti.tt for ti in times])
+    diff = sat.at(t_vec) - ground.at(t_vec)
+    alt, az, dist = diff.altaz()
+    return alt.degrees  # numpy array
 
+def find_passes(times, alt_deg, min_elev_deg=10.0):
+    passes = []
+    in_pass = False
+    start_i = 0
+    for i, a in enumerate(alt_deg):
+        if not in_pass and a >= min_elev_deg:
+            in_pass = True
+            start_i = i
+        elif in_pass and a < min_elev_deg:
+            end_i = i - 1
+            if end_i >= start_i:
+                seg = alt_deg[start_i:end_i+1]
+                k = int(np.argmax(seg))
+                peak_i = start_i + k
+                duration_s = int((times[end_i].tt - times[start_i].tt) * 86400.0)
+                passes.append({
+                    "start_utc": times[start_i].utc_datetime().isoformat(),
+                    "end_utc": times[end_i].utc_datetime().isoformat(),
+                    "peak_utc": times[peak_i].utc_datetime().isoformat(),
+                    "max_elev_deg": float(seg[k]),
+                    "duration_s": duration_s,
+                })
+            in_pass = False
+    # if we ended while still in pass, close it
+    if in_pass:
+        end_i = len(alt_deg) - 1
+        seg = alt_deg[start_i:end_i+1]
+        k = int(np.argmax(seg))
+        peak_i = start_i + k
+        duration_s = int((times[end_i].tt - times[start_i].tt) * 86400.0)
+        passes.append({
+            "start_utc": times[start_i].utc_datetime().isoformat(),
+            "end_utc": times[end_i].utc_datetime().isoformat(),
+            "peak_utc": times[peak_i].utc_datetime().isoformat(),
+            "max_elev_deg": float(seg[k]),
+            "duration_s": duration_s,
+        })
+    return passes
+
+# ---------- Animation ----------
+def make_groundtrack_animation(lats, lons, title: str, outfile: str):
+    # downsample to control frames
+    lons = ((np.array(lons) + 180) % 360) - 180
+    lats = np.array(lats)
+    n = len(lats)
+    step = max(1, n // ANIM_MAX_FRAMES)
+    lons = lons[::step]; lats = lats[::step]
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+    wx, wy = world_outline()
+    ax.plot(wx, wy, lw=1, alpha=0.6)
+    ax.set_xlim(-180, 180); ax.set_ylim(-90, 90)
+    ax.set_xlabel("Longitude (deg)"); ax.set_ylabel("Latitude (deg)")
+    ax.set_title(title); ax.grid(True, alpha=0.3)
+    (line,) = ax.plot([], [], lw=1.6)
+
+    def init():
+        line.set_data([], [])
+        return (line,)
+
+    def update(k):
+        line.set_data(lons[:k], lats[:k])
+        return (line,)
+
+    anim = FuncAnimation(fig, update, frames=len(lats), init_func=init, blit=True)
+    anim.save(outfile, writer=PillowWriter(fps=ANIM_FPS))
+    plt.close(fig)
+
+# -----------------------------
+# MAIN
+# -----------------------------
 def main():
-    if NORAD_IDS == [99999]:
-        print("[NOTE] Please set NORAD_IDS to your target satellite (e.g., [25544] for ISS to test).")
-
-    # 1) Load historical TLEs within the window
-    tles = load_tles(NORAD_IDS, START_UTC, END_UTC)
-    if not tles:
+    if not NORAD_IDS:
+        print("[NOTE] Please set NORAD_IDS to at least one target satellite (e.g., [25544] for ISS to test).")
         return
 
-    # 2) Select sampling epochs (weekly by default)
-    epochs = select_epochs(tles, SAMPLE_EVERY_DAYS)
-    print(f"Selected {len(epochs)} epoch(s) between {START_UTC.date()} and {END_UTC.date()}.")
+    # 1) Load historical TLEs for all requested sats
+    tles_all = load_tles(NORAD_IDS, START_UTC, END_UTC)
+    if not tles_all:
+        return
+
+    # 2) Choose epochs per satellite
+    epochs_by_sat = select_epochs_per_sat(tles_all, SAMPLE_EVERY_DAYS)
 
     weekly_rows = []
+    pass_rows = []
 
-    for row in epochs:
-        sat = EarthSatellite(row.line1, row.line2)
-        a_km, e, i_deg, raan_deg = elements_from_satellite(sat)
+    for norad, epochs in epochs_by_sat.items():
+        print(f"\n[Sat {norad}] Selected {len(epochs)} epoch(s) between {START_UTC.date()} and {END_UTC.date()}.")
 
-        # Propagate 24h from this epoch
-        times, lats, lons, alts = propagate_24h(sat, row.epoch_dt, PROP_STEP_SECONDS)
-        hh = [(t.tt - times[0].tt) * 24.0 for t in times]
+        if len(epochs) == 0:
+            continue
 
-        # Save plots
-        tag = row.epoch_dt.strftime("%Y%m%d")
-        gt_file = os.path.join(FIG_DIR, f"ground_track_{row.norad}_{tag}.png")
-        at_file = os.path.join(FIG_DIR, f"altitude_time_{row.norad}_{tag}.png")
-        plot_groundtrack(
-            lats, lons,
-            title=f"Ground Track (24h) from TLE epoch {row.epoch_dt.isoformat()} UTC,NORAD {row.norad}",
-            outfile=gt_file,
-            gs_lat=GROUND_STATION_LAT, gs_lon=GROUND_STATION_LON)
-        plot_altitude(
-            hh, alts,
-            title=f"Altitude vs Time (24h) from TLE epoch {row.epoch_dt.isoformat()} UTC,NORAD {row.norad}",
-            outfile=at_file)
+        # Mid-window epoch for this sat (for the maneuver plan + animation)
+        ref = epochs[len(epochs)//2]
+        sat_ref = EarthSatellite(ref.line1, ref.line2)
+        a_km_ref, e_ref, i_deg_ref, raan_deg_ref = elements_from_satellite(sat_ref)
 
-        weekly_rows.append({
-            "norad": row.norad,
-            "epoch_utc": row.epoch_dt.isoformat(),
-            "a_km": a_km,
-            "e": e,
-            "i_deg": i_deg,
-            "raan_deg": raan_deg,
-        })
+        # Treat reference orbit as circular
+        h_ref_km = max(0.0, a_km_ref - R_EARTH_KM)
+        r1_km = R_EARTH_KM + h_ref_km
+        r2_km = R_EARTH_KM + (h_ref_km + TARGET_ALTITUDE_DELTA_KM)
+        dv1, dv2, tof_s = hohmann_delta_v(r1_km, r2_km)
+        dv_total = dv1 + dv2
+        m_prop, m_final = tsiolkovsky(M0_KG, dv_total, ISP_S, g0=G0)
 
-    # 3) Save weekly summary and RAAN drift
-    df = pd.DataFrame(weekly_rows).sort_values(["norad", "epoch_utc"]).reset_index(drop=True)
-    df["epoch_dt"] = pd.to_datetime(df["epoch_utc"], utc=True)
-    df["raan_drift_deg_per_day"] = np.nan
-    for norad in df["norad"].unique():
-        idx = df.index[df["norad"] == norad].tolist()
-        for j in range(1, len(idx)):
-            i0, i1 = idx[j-1], idx[j]
-            draan = df.loc[i1, "raan_deg"] - df.loc[i0, "raan_deg"]
-            dt_days = (df.loc[i1, "epoch_dt"] - df.loc[i0, "epoch_dt"]).total_seconds()/86400.0
-            # wrap
-            if draan > 180: draan -= 360
-            if draan < -180: draan += 360
-            df.loc[i1, "raan_drift_deg_per_day"] = draan / dt_days if dt_days > 0 else np.nan
+        # Write maneuver plan for this sat
+        plan_txt = textwrap.dedent(f"""
+        === Maneuver Plan (Reference Epoch) ===
+        NORAD: {norad}
+        Reference TLE epoch (UTC): {ref.epoch_dt.isoformat()}
 
-    df.drop(columns=["epoch_dt"], inplace=True)
-    out_csv = os.path.join(SUM_DIR, "orbit_weekly_summary.csv")
-    df.to_csv(out_csv, index=False)
+        Assumed circular altitude at reference: ~{h_ref_km:.1f} km
+        Target circular altitude: ~{h_ref_km + TARGET_ALTITUDE_DELTA_KM:.1f} km
 
-    # 4) Maneuver plan at mid-window epoch (Hohmann altitude raise)
-    if len(epochs) == 0:
-        print("No epochs selected; exiting.")
-        return
-    ref = epochs[len(epochs)//2]
-    sat_ref = EarthSatellite(ref.line1, ref.line2)
-    a_km, e, i_deg, raan_deg = elements_from_satellite(sat_ref)
+        Burn 1 (inject to transfer): dv1 = {dv1:7.2f} m/s at {ref.epoch_dt.isoformat()} UTC
+        Burn 2 (circularize):       dv2 = {dv2:7.2f} m/s at {(ref.epoch_dt + timedelta(seconds=tof_s)).isoformat()} UTC
+        Transfer time:               {tof_s/60.0:7.2f} minutes
 
-    # Treat reference orbit as circular at altitude h ≈ a - R_E (ok for small e)
-    h_ref_km = max(0.0, a_km - R_EARTH_KM)
-    r1_km = R_EARTH_KM + h_ref_km
-    r2_km = R_EARTH_KM + (h_ref_km + TARGET_ALTITUDE_DELTA_KM)
+        ΔV total: {dv_total:.2f} m/s
 
-    dv1, dv2, tof_s = hohmann_delta_v(r1_km, r2_km)
-    dv_total = dv1 + dv2
+        Fuel estimate (Tsiolkovsky):
+          m0 = {M0_KG:.3f} kg, Isp = {ISP_S:.1f} s, g0 = {G0:.5f} m/s²
+          propellant ≈ {m_prop:.4f} kg, final mass ≈ {m_final:.4f} kg
+        """)
+        with open(os.path.join(SUM_DIR, f"maneuver_plan_{norad}.txt"), "w", encoding="utf-8") as f:
+            f.write(plan_txt)
 
-    m_prop, m_final = tsiolkovsky(M0_KG, dv_total, ISP_S, g0=G0)
+        # Animation for the reference epoch (if enabled)
+        if MAKE_ANIMATION:
+            times_a, lats_a, lons_a, _alts_a = propagate_24h(sat_ref, ref.epoch_dt, PROP_STEP_SECONDS)
+            anim_file = os.path.join(FIG_DIR, f"animation_{norad}_{ref.epoch_dt.strftime('%Y%m%d')}.gif")
+            make_groundtrack_animation(
+                lats_a, lons_a,
+                title=f"Ground Track Animation (24h) — NORAD {norad}, start {ref.epoch_dt.isoformat()}",
+                outfile=anim_file
+            )
 
-    plan_txt = textwrap.dedent(f"""
-    === Maneuver Plan (Reference Epoch) ===
-    NORAD: {ref.norad}
-    Reference TLE epoch (UTC): {ref.epoch_dt.isoformat()}
+        # Loop all epochs for plots, summary, and pass detection
+        for row in epochs:
+            sat = EarthSatellite(row.line1, row.line2)
+            a_km, e, i_deg, raan_deg = elements_from_satellite(sat)
 
-    Assumed circular altitude at reference: ~{h_ref_km:.1f} km
-    Target circular altitude: ~{h_ref_km + TARGET_ALTITUDE_DELTA_KM:.1f} km
+            times, lats, lons, alts = propagate_24h(sat, row.epoch_dt, PROP_STEP_SECONDS)
+            hh = [(t.tt - times[0].tt) * 24.0 for t in times]
 
-    Burn 1 (inject to transfer): dv1 = {dv1:7.2f} m/s at {ref.epoch_dt.isoformat()} UTC
-    Burn 2 (circularize):       dv2 = {dv2:7.2f} m/s at {(ref.epoch_dt + timedelta(seconds=tof_s)).isoformat()} UTC
-    Transfer time:               {tof_s/60.0:7.2f} minutes
+            # Save plots
+            tag = row.epoch_dt.strftime("%Y%m%d")
+            gt_file = os.path.join(FIG_DIR, f"ground_track_{norad}_{tag}.png")
+            at_file = os.path.join(FIG_DIR, f"altitude_time_{norad}_{tag}.png")
+            plot_groundtrack(
+                lats, lons,
+                title=f"Ground Track (24h) from TLE epoch {row.epoch_dt.isoformat()} UTC, NORAD {norad}",
+                outfile=gt_file,
+                gs_lat=GROUND_STATION_LAT, gs_lon=GROUND_STATION_LON
+            )
+            plot_altitude(
+                hh, alts,
+                title=f"Altitude vs Time (24h) from TLE epoch {row.epoch_dt.isoformat()} UTC, NORAD {norad}",
+                outfile=at_file
+            )
 
-    ΔV total: {dv_total:.2f} m/s
+            weekly_rows.append({
+                "norad": norad,
+                "epoch_utc": row.epoch_dt.isoformat(),
+                "a_km": a_km, "e": e, "i_deg": i_deg, "raan_deg": raan_deg,
+            })
 
-    Fuel estimate (Tsiolkovsky):
-      m0 = {M0_KG:.3f} kg, Isp = {ISP_S:.1f} s, g0 = {G0:.5f} m/s²
-      propellant ≈ {m_prop:.4f} kg, final mass ≈ {m_final:.4f} kg
-    """)
+            # Pass prediction for this 24h window (Bengaluru)
+            alt_deg = elevation_profile(sat, times)
+            for p in find_passes(times, alt_deg, MIN_ELEVATION_DEG):
+                p_row = {"norad": norad, "epoch_day": row.epoch_dt.date().isoformat(),
+                         "start_utc": p["start_utc"], "end_utc": p["end_utc"],
+                         "peak_utc": p["peak_utc"], "max_elev_deg": p["max_elev_deg"],
+                         "duration_s": p["duration_s"]}
+                pass_rows.append(p_row)
 
-    with open(os.path.join(SUM_DIR, "maneuver_plan.txt"), "w", encoding="utf-8") as f:
-        f.write(plan_txt)
+    # Save weekly summary (elements + RAAN drift per sat)
+    if weekly_rows:
+        df = pd.DataFrame(weekly_rows).sort_values(["norad", "epoch_utc"]).reset_index(drop=True)
+        df["epoch_dt"] = pd.to_datetime(df["epoch_utc"], utc=True)
+        df["raan_drift_deg_per_day"] = np.nan
+        for norad in df["norad"].unique():
+            idx = df.index[df["norad"] == norad].tolist()
+            for j in range(1, len(idx)):
+                i0, i1 = idx[j-1], idx[j]
+                draan = df.loc[i1, "raan_deg"] - df.loc[i0, "raan_deg"]
+                if draan > 180: draan -= 360
+                if draan < -180: draan += 360
+                dt_days = (df.loc[i1, "epoch_dt"] - df.loc[i0, "epoch_dt"]).total_seconds()/86400.0
+                df.loc[i1, "raan_drift_deg_per_day"] = draan / dt_days if dt_days > 0 else np.nan
+        df.drop(columns=["epoch_dt"], inplace=True)
+        out_csv = os.path.join(SUM_DIR, "orbit_weekly_summary.csv")
+        df.to_csv(out_csv, index=False)
 
-    print("Done. Outputs:")
-    print(f" - {out_csv}")
-    print(f" - {os.path.join(SUM_DIR, 'maneuver_plan.txt')}")
-    print(f" - {FIG_DIR}/*.png")
+    # Save passes CSV
+    if pass_rows:
+        dfp = pd.DataFrame(pass_rows).sort_values(["norad", "start_utc"])
+        out_pass = os.path.join(SUM_DIR, "passes_bengaluru.csv")
+        dfp.to_csv(out_pass, index=False)
 
+    print("\nDone. Outputs:")
+    print(f" - {SUM_DIR}/orbit_weekly_summary.csv (elements + RAAN drift)")
+    print(f" - {SUM_DIR}/passes_bengaluru.csv (visible passes in sampled 24h windows)")
+    print(f" - {SUM_DIR}/maneuver_plan_<NORAD>.txt")
+    print(f" - {FIG_DIR}/ground_track_*.png, altitude_time_*.png, animation_*.gif")
 
 if __name__ == "__main__":
     main()

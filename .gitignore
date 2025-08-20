@@ -20,3 +20,9 @@ Thumbs.db
 # Generated outputs (optional to ignore)
 figures/
 summary/
+
+# Generated media
+*.gif
+*.mp4
+figures/
+summary/
